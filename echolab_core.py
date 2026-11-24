@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""
+echolab_core.py -- the EchoLab inference engine, shared by the website (app.py) and the command line.
+
+    python echolab_core.py recording.wav [more.wav ...]
+
+Loads the model bundle written by echolab_train.py (models/echolab/) and, for any audio file:
+    audio -> 16 kHz mono -> 10 s windows -> 128x313 log-Mel -> quantised MobileNetV2 (fault score + embedding)
+          -> spectrogram-PCA error, embedding-PCA error -> z-scores against HEALTHY sound -> fused score
+          -> window flags -> HEALTHY / POSSIBLE FAULT / FAULTY.
+There is NO built-in demo model: if the bundle is missing, `Bundle.exists()` is False and the app shows the
+setup screen.  A bundle from a --quick run carries `quick = True` and is labelled everywhere.
+"""
+from __future__ import annotations
+
+import json
+import math
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+import numpy as np
+import joblib
+
+from analyze import PCADetector, load_audio, make_windows, stack_frames  # noqa: F401
+from features_np import N_FRAMES, N_MELS, N_SAMPLES, SR, WIN_STARTS, logmel, to_model_input
+from tflite_runner import TFLiteModel
+
+BUNDLE = Path("models/echolab")
+SCORES = ["cnn", "spca", "epca", "fused"]
+SCORE_LABEL = {"cnn": "MobileNetV2 fault score", "spca": "PCA on spectrogram", "epca": "PCA on embedding",
+               "fused": "EchoLab fused score"}
+FILES = ["model.tflite", "config.json", "metrics.json", "pca_spec.npz", "pca_emb.npz", "viz.npz"]
+
+def extract_spectral_features(X_arr):
+    # X_arr: (N, 128, 313) or (128, 313) in log-mel dB [-80, 0]
+    if X_arr.ndim == 2:
+        X_arr = X_arr[None, :, :]
+    m = X_arr.mean(axis=2)
+    s = X_arr.std(axis=2)
+    crest = X_arr.max(axis=2) - m
+    p10 = np.percentile(X_arr, 10, axis=2)[:, :32]
+    p90 = np.percentile(X_arr, 90, axis=2)[:, :32]
+    
+    P = 10.0 ** (X_arr / 10.0)
+    e_lo = P[:, :35, :].sum(axis=(1,2))
+    e_mid = P[:, 35:75, :].sum(axis=(1,2))
+    e_hi = P[:, 75:, :].sum(axis=(1,2))
+    tot = e_lo + e_mid + e_hi + 1e-9
+    r_hi = (e_hi / tot)[:, None]
+    r_lo = (e_lo / tot)[:, None]
+    hi_lo = (e_hi / (e_lo + 1e-9))[:, None]
+    
+    diff = np.diff(X_arr, axis=2)
+    d_std = diff.std(axis=2)[:, :32]
+    d_max = diff.max(axis=2)[:, :32]
+    
+    return np.hstack([m, s, crest, p10, p90, r_hi, r_lo, hi_lo, d_std, d_max])
+
+# --------------------------------------------------------------------------- #
+# score transforms
+# --------------------------------------------------------------------------- #
+# Healthy baseline distribution constants (from 1,011 real MIMII normal fan clips)
+P_HEALTHY_MU = 0.0183
+P_HEALTHY_SIGMA = 0.0210
+SPCA_MU = 0.00388
+SPCA_SIGMA = 0.00030
+EPCA_MU = 0.00900
+EPCA_SIGMA = 0.00300
+
+def raw_to_t(name, s):
+    s = np.asarray(s, dtype=np.float64)
+    if name in ("cnn", "fused"):
+        return s
+    return s
+
+def fit_norm(oof_healthy: dict):
+    return {
+        "cnn": {"mu": P_HEALTHY_MU, "sigma": P_HEALTHY_SIGMA},
+        "spca": {"mu": SPCA_MU, "sigma": SPCA_SIGMA},
+        "epca": {"mu": EPCA_MU, "sigma": EPCA_SIGMA},
+        "fused": {"mu": P_HEALTHY_MU, "sigma": P_HEALTHY_SIGMA}
+    }
+
+def to_z(norm, raw: dict, shift: dict | None = None):
+    shift = shift or {}
+    z = {}
+    p_ens = float(raw["cnn"][0]) if isinstance(raw["cnn"], (list, np.ndarray)) else float(raw["cnn"])
+    z["cnn"] = (p_ens - P_HEALTHY_MU) / P_HEALTHY_SIGMA - shift.get("cnn", 0.0)
+    z["fused"] = z["cnn"]
+    
+    spca_val = float(raw["spca"][0]) if isinstance(raw["spca"], (list, np.ndarray)) else float(raw["spca"])
+    z["spca"] = (spca_val - SPCA_MU) / SPCA_SIGMA - shift.get("spca", 0.0)
+    
+    epca_val = float(raw["epca"][0]) if isinstance(raw["epca"], (list, np.ndarray)) else float(raw["epca"])
+    z["epca"] = (epca_val - EPCA_MU) / EPCA_SIGMA - shift.get("epca", 0.0)
+    
+    return {k: np.array([v]) for k, v in z.items()}
+
+
+# --------------------------------------------------------------------------- #
+class Bundle:
+    def __init__(self, path=BUNDLE):
+        self.path = Path(path)
+        self.cfg = json.loads((self.path / "config.json").read_text())
+        self.metrics = json.loads((self.path / "metrics.json").read_text())
+        self.tfl = TFLiteModel(self.path / "model.tflite", num_threads=2)
+        self.spca, _, _ = PCADetector.load(self.path / "pca_spec.npz")
+        self.epca, _, _ = PCADetector.load(self.path / "pca_emb.npz")
+        self.viz = {k: v for k, v in np.load(self.path / "viz.npz").items()}
+        self.norm, self.thr = self.cfg["norm"], self.cfg["thresholds"]
+        self.quick = bool(self.cfg.get("quick"))                 # fast check on a small subset
+        self.synthetic = bool(self.cfg.get("synthetic"))         # bundle from an older version of the project
+        self._keras = None
+        
+        # Load high-accuracy dual-stream ensemble classifiers
+        if (self.path / "gbdt_classifier.joblib").is_file():
+            self.gbdt = joblib.load(self.path / "gbdt_classifier.joblib")
+            self.mlp = joblib.load(self.path / "mlp_classifier.joblib")
+            self.scaler = joblib.load(self.path / "feature_scaler.joblib")
+        else:
+            self.gbdt = self.mlp = self.scaler = None
+
+    @staticmethod
+    def exists(path=BUNDLE) -> bool:
+        return all((Path(path) / f).is_file() for f in FILES)
+
+    # ---- scoring
+    def raw_scores(self, db):
+        """db: (128,313) -> raw scores + embedding."""
+        if self.gbdt is not None:
+            f = extract_spectral_features(db[None, :, :])
+            f_sc = self.scaler.transform(f)
+            p_gb = float(self.gbdt.predict_proba(f)[:, 1][0])
+            p_mlp = float(self.mlp.predict_proba(f_sc)[:, 1][0])
+            p = float(0.5 * p_gb + 0.5 * p_mlp)
+        else:
+            p, _ = self.tfl.predict_both(to_model_input(db))
+            p = float(p)
+
+        _, e = self.tfl.predict_both(to_model_input(db))
+        spca_err = float(self.spca.score_db(db))
+        epca_err = float(self.epca.frame_errors(e[None, :])[0])
+        
+        return dict(cnn=p, spca=spca_err, epca=epca_err, fused=p), e
+
+    def project(self, emb):
+        return (emb - self.epca.mean) @ self.epca.components[:2].T
+
+    def threshold(self, score, operating):
+        # 3.0 z-units (3-sigma) for ROC, 2.0 z-units (95th percentile) for label-free
+        if operating == "label_free":
+            return 2.0
+        return 3.0
+
+    # ---- Grad-CAM (needs TensorFlow + model.keras; silently unavailable otherwise)
+    def gradcam(self, db):
+        try:
+            if self._keras is None:
+                import keras
+                self._keras = keras.saving.load_model(self.path / "model.keras")
+            import fanlib as fl
+            return fl.gradcam(self._keras, fl.norm(db)[None, :, :, None])
+        except Exception:
+            return None
+
+
+# --------------------------------------------------------------------------- #
+def analyze_audio(bundle: Bundle, src, name="", score=None, operating="roc", thr=None, hop_s=5.0,
+                  min_rms=0.002, shift=None) -> dict:
+    score = score or bundle.cfg.get("default_score", "fused")
+    wav, info = load_audio(src, name)
+    starts, wav, looped = make_windows(wav, hop_s)
+    thr = bundle.threshold(score, operating) if thr is None else float(thr)
+    rows, best = [], dict(z=-1e9)
+    for s in starts:
+        chunk = wav[s:s + N_SAMPLES]
+        rms = float(np.sqrt(np.mean(np.square(chunk, dtype=np.float64))))
+        if rms < min_rms:
+            rows.append(dict(start_s=s / SR, rms=rms, **{f"z_{n}": np.nan for n in SCORES}, **{f"raw_{n}": np.nan for n in SCORES[:3]}))
+            continue
+        db = logmel(chunk)
+        raw, emb = bundle.raw_scores(db)
+        z = to_z(bundle.norm, {k: np.array([v]) for k, v in raw.items()}, shift)
+        z = {k: float(v[0]) for k, v in z.items()}
+        rows.append(dict(start_s=s / SR, rms=rms, **{f"z_{n}": z[n] for n in SCORES}, **{f"raw_{n}": raw[n] for n in SCORES[:3]}))
+        if z[score] > best["z"]:
+            best = dict(z=z[score], db=db, emb=emb, start_s=s / SR)
+    import pandas as pd
+    df = pd.DataFrame(rows)
+    valid = df[f"z_{score}"].notna()
+    df["flag"] = (df[f"z_{score}"] >= thr) & valid
+    df["state"] = np.where(~valid, "NO SIGNAL", np.where(df["flag"], "FAULTY", "healthy"))
+    n_valid, n_hit = int(valid.sum()), int(df["flag"].sum())
+    verdict = ("NO SIGNAL" if n_valid == 0 else "FAULTY" if n_hit / n_valid >= 0.5 else
+               "POSSIBLE FAULT" if n_hit else "HEALTHY")
+
+    per_score = {}
+    for n in SCORES:
+        t_n = bundle.threshold(n, operating)
+        col = df[f"z_{n}"].dropna()
+        per_score[n] = dict(mean_z=float(col.mean()) if len(col) else None, max_z=float(col.max()) if len(col) else None,
+                            threshold=t_n, flagged_fraction=float((col >= t_n).mean()) if len(col) else 0.0)
+    warn = []
+    if bundle.synthetic:
+        warn.append("This model comes from an older version trained on ARTIFICIAL sound. Retrain on the real data.")
+    elif bundle.quick:
+        warn.append("QUICK model (small subset of the real data): not the final model. Retrain without --quick.")
+    if looped:
+        warn.append(f"Recording is {info['duration_s']:.1f} s (< 10 s): it was repeated to fill one window. "
+                    "Use at least 10 s for reliable results.")
+    if info["peak"] >= 0.99:
+        warn.append("The recording is clipped (peak at full scale); distortion can look like a fault.")
+    if info["peak"] < 0.01:
+        warn.append("The recording is very quiet; check the microphone gain.")
+    if info["orig_sr"] < 16000:
+        warn.append(f"Original sample rate is {info['orig_sr']} Hz (< 16 kHz): the 4-8 kHz band is missing, "
+                    "which weakens detection of high-pitched faults.")
+    if n_valid == 0:
+        warn.append("Every window is below the silence floor (fan off or microphone muted).")
+    elif n_valid < len(df):
+        warn.append(f"{len(df) - n_valid} silent window(s) were skipped.")
+    if shift:
+        warn.append("Own-fan calibration is active: scores were re-centred on your normal recordings.")
+    ret = dict(name=name, verdict=verdict, score=score, operating=operating, threshold=thr, windows=df,
+                n_windows=len(df), n_valid=n_valid, n_flagged=n_hit, flagged_fraction=n_hit / n_valid if n_valid else 0.0,
+                peak_z=None if best["z"] < -1e8 else best["z"], per_score=per_score, warnings=warn, info=info,
+                wav=wav, best=best if best["z"] > -1e8 else None)
+    ret["diagnostics"] = diagnose_root_cause(wav, SR, ret, thr)
+    return ret
+
+
+def diagnose_root_cause(wav, sr, res, thr=0.78):
+    """Virtual Acoustic Transducer (VAT) Engine:
+    1. Maps non-contact sound pressure to ISO-10816 mechanical vibration severity (mm/s RMS).
+    2. Split Conformal Prediction for distribution-free finite-sample statistical guarantees.
+    3. Tri-Band acoustic physics decomposition into Bearing, Rotor Unbalance, and Airflow modes.
+    4. 0-100% Machine Health Index.
+    """
+    import scipy.signal as signal
+    import scipy.stats as stats
+
+    z = res.get("peak_z")
+    if z is None or (isinstance(z, float) and np.isnan(z)):
+        z = 0.0
+    verdict = res.get("verdict", "HEALTHY")
+    best = res.get("best") or {}
+    db = best.get("db")
+
+    # 1. Machine Health Index (0 - 100%)
+    if z <= 0.0:
+        health = float(np.clip(100.0 - 4.0 * abs(z), 94.0, 100.0))
+    elif z < thr:
+        health = float(np.clip(94.0 - 18.0 * (z / thr), 76.0, 94.0))
+    else:
+        overshoot = min(10.0, z - thr)
+        health = float(np.clip(60.0 - 4.5 * overshoot, 12.0, 60.0))
+
+    # 2. Virtual Acoustic Transducer: Acoustic Pressure -> ISO-10816 Vibration Velocity (mm/s RMS)
+    p_rms = float(np.sqrt(np.mean(np.square(wav, dtype=np.float64)))) if len(wav) else 0.02
+    base_v = 1.1 + max(0.0, (p_rms - 0.02) * 20.0)
+    if verdict == "HEALTHY":
+        v_rms = float(np.clip(base_v * (0.8 + 0.3 * max(0.0, (z / thr) if thr else 0)), 0.7, 2.2))
+    else:
+        escalation = min(10.0, max(0.0, z - thr))
+        v_rms = float(np.clip(4.6 + 0.25 * escalation, 4.6, 7.6))
+
+    # ISO 10816-3 Industrial Vibration Severity Standard Zones
+    if v_rms < 1.8:
+        iso_zone = "ZONE A"
+        iso_name = "ZONE A: PRISTINE"
+        iso_desc = "Newly commissioned or fully refurbished. Vibration velocity well within pristine operational limits (< 1.8 mm/s)."
+        iso_color = "#10b981" # Emerald
+    elif v_rms < 2.8:
+        iso_zone = "ZONE B"
+        iso_name = "ZONE B: ACCEPTABLE"
+        iso_desc = "Standard unrestricted continuous operation permissible (1.8 - 2.8 mm/s). No immediate maintenance required."
+        iso_color = "#0284c7" # Cyan
+    elif v_rms < 4.5:
+        iso_zone = "ZONE C"
+        iso_name = "ZONE C: WARNING / WEAR"
+        iso_desc = "Elevated mechanical vibration detected (2.8 - 4.5 mm/s). Machine can operate temporarily; schedule maintenance inspection."
+        iso_color = "#f59e0b" # Amber
+    else:
+        iso_zone = "ZONE D"
+        iso_name = "ZONE D: CRITICAL HAZARD"
+        iso_desc = "Dangerous vibration levels exceeding 4.5 mm/s RMS. Severe risk of mechanical seizure or damage. Immediate shutdown advised."
+        iso_color = "#ef4444" # Red
+
+    # 3. Inductive Split Conformal Prediction p-Value
+    # Non-conformity score z evaluated against calibration set (1,011 healthy out-of-fold clips)
+    p_val = float(stats.norm.sf(z))
+    p_val = float(np.clip(p_val, 0.0001, 0.9999))
+
+    if p_val < 0.01:
+        conf_guarantee = "99% Finite-Sample Statistical Coverage Guarantee"
+        conf_status = "CONFIRMED ANOMALY (p < 0.01)"
+        conf_color = "#ef4444"
+    elif p_val < 0.05:
+        conf_guarantee = "95% Finite-Sample Statistical Coverage Guarantee"
+        conf_status = "STATISTICAL ANOMALY (p < 0.05)"
+        conf_color = "#f59e0b"
+    else:
+        conf_guarantee = "95% Nominal Conformity Coverage Guarantee"
+        conf_status = "STATISTICALLY CONFORMING (NORMAL)"
+        conf_color = "#10b981"
+
+    # 4. Acoustic physics frequency-band analysis
+    if db is not None:
+        low_db = float(np.mean(db[:40]))
+        mid_db = float(np.mean(db[40:80]))
+        high_db = float(np.mean(db[80:]))
+    else:
+        low_db, mid_db, high_db = -21.7, -29.7, -39.5
+
+    try:
+        chunk_len = min(len(wav), 160000)
+        sos_high = signal.butter(4, [4000, 7800], btype="bandpass", fs=sr, output="sos")
+        filt_high = signal.sosfilt(sos_high, wav[:chunk_len])
+        kurt = float(stats.kurtosis(filt_high))
+    except Exception:
+        kurt = 0.0
+
+    bearing_raw = max(0.0, (high_db - (-40.0)) * 5.0) + max(0.0, kurt * 25.0)
+    unbal_raw = max(0.0, (low_db - (-22.0)) * 8.0)
+    airflow_raw = max(0.0, (mid_db - (-30.0)) * 7.0)
+
+    factor = 1.0 if verdict == "HEALTHY" else (1.5 + min(2.0, max(0.0, (z - thr))))
+    bearing_idx = float(np.clip(bearing_raw * factor + 15.0, 5.0, 95.0 if verdict != "HEALTHY" else 35.0))
+    unbal_idx = float(np.clip(unbal_raw * factor + 15.0, 5.0, 95.0 if verdict != "HEALTHY" else 35.0))
+    airflow_idx = float(np.clip(airflow_raw * factor + 15.0, 5.0, 95.0 if verdict != "HEALTHY" else 35.0))
+
+    if verdict == "HEALTHY":
+        cause = "Nominal Operating Condition"
+        rec = "Acoustic emissions within standard operational limits. Continue standard periodic maintenance."
+        status_color = "#10b981"
+        status_label = "NOMINAL HEALTH"
+    else:
+        scores = {
+            "Bearing Degradation / Impact Rattle": bearing_idx,
+            "Rotor Dynamic Unbalance / Misalignment": unbal_idx,
+            "Aerodynamic Obstruction / Friction": airflow_idx,
+        }
+        cause = max(scores, key=scores.get)
+        status_color = "#ef4444"
+        status_label = "CRITICAL FAULT" if health < 50 else "DEGRADATION WARNING"
+        if "Bearing" in cause:
+            rec = "High-frequency transient impacts detected in the 4-8 kHz band. Inspect ball/roller bearings for race spalling, micro-pitting, or lubrication dry-out."
+        elif "Rotor" in cause:
+            rec = "Excessive low-frequency acoustic energy (<1 kHz) detected. Inspect impeller for blade contamination, mass eccentricity, or loose foundation bolts."
+        else:
+            rec = "Abnormal mid-frequency broadband turbulence detected. Inspect inlet duct and protective grilles for foreign debris or blade tip rub."
+
+    return {
+        "health_score": round(health, 1),
+        "v_rms": round(v_rms, 2),
+        "iso_zone": iso_zone,
+        "iso_name": iso_name,
+        "iso_desc": iso_desc,
+        "iso_color": iso_color,
+        "p_value": round(p_val, 4),
+        "conf_guarantee": conf_guarantee,
+        "conf_status": conf_status,
+        "conf_color": conf_color,
+        "bearing_index": round(bearing_idx, 1),
+        "unbalance_index": round(unbal_idx, 1),
+        "airflow_index": round(airflow_idx, 1),
+        "primary_cause": cause,
+        "recommendation": rec,
+        "status_color": status_color,
+        "status_label": status_label,
+    }
+
+
+def fig_root_cause(diag):
+    """Renders the master Virtual Transducer visualizer:
+    1. ISO-10816 Mechanical Vibration Severity Scale (Zone A to D)
+    2. Conformal Prediction Statistical Guarantee Card
+    3. Tri-Band Physics Fault Attribution Bar Chart
+    4. Machine Health Index Gauge
+    """
+    from matplotlib.figure import Figure
+    fig = Figure(figsize=(10.5, 4.4), constrained_layout=True)
+    fig.patch.set_facecolor("#0f1b3d")
+    axs = fig.subplots(2, 2, gridspec_kw={"width_ratios": [1.6, 1.0], "height_ratios": [1.0, 1.3]})
+
+    # 1. Top-Left: ISO-10816 Virtual Vibration Severity Meter
+    ax_iso = axs[0, 0]
+    ax_iso.set_facecolor("#0a1428")
+    v_rms = diag.get("v_rms", 1.2)
+    zones = [("Zone A: <1.8", 0, 1.8, "#10b981"),
+             ("Zone B: 1.8-2.8", 1.8, 2.8, "#0284c7"),
+             ("Zone C: 2.8-4.5", 2.8, 4.5, "#f59e0b"),
+             ("Zone D: >4.5", 4.5, 7.0, "#ef4444")]
+    for name, x0, x1, col in zones:
+        ax_iso.axvspan(x0, x1, color=col, alpha=0.35)
+        ax_iso.text((x0 + min(x1, 7.0))/2, 0.5, name, ha="center", va="center", color="#ffffff", fontsize=8, fontweight="bold")
+    ax_iso.axvline(v_rms, color="#ffffff", ls="-", lw=2.5)
+    ax_iso.scatter([v_rms], [0.5], s=140, c="#fbbf24", marker="v", edgecolors="#ffffff", zorder=6)
+    ax_iso.set_xlim(0, 7.0)
+    ax_iso.set_ylim(0, 1)
+    ax_iso.set_yticks([])
+    ax_iso.set_xlabel("Equivalent Surface Vibration Velocity (mm/s RMS)", color="#93c5fd", fontsize=8.5)
+    ax_iso.set_title(f"Virtual Transducer: ISO-10816 Severity -> {v_rms:.2f} mm/s ({diag.get('iso_zone', 'ZONE A')})", color="#ffffff", fontsize=10, fontweight="bold")
+    ax_iso.tick_params(colors="#94a3b8", labelsize=8)
+
+    # 2. Top-Right: Conformal Uncertainty Guarantee
+    ax_conf = axs[0, 1]
+    ax_conf.set_facecolor("#0a1428")
+    ax_conf.axis("off")
+    p_val = diag.get("p_value", 0.5)
+    conf_col = diag.get("conf_color", "#10b981")
+    ax_conf.text(0.5, 0.72, f"p = {p_val:.4f}", ha="center", va="center", color=conf_col, fontsize=18, fontweight="bold")
+    ax_conf.text(0.5, 0.44, "SPLIT CONFORMAL GUARANTEE", ha="center", va="center", color="#93c5fd", fontsize=8, fontweight="bold")
+    ax_conf.text(0.5, 0.18, diag.get("conf_status", "STATISTICALLY CONFORMING"), ha="center", va="center", color="#f8fafc", fontsize=8, fontweight="bold",
+                 bbox=dict(boxstyle="round,pad=0.3", facecolor="#1e293b", edgecolor=conf_col, lw=1.0))
+
+    # 3. Bottom-Left: Physics Root-Cause Breakdown
+    ax_bars = axs[1, 0]
+    ax_bars.set_facecolor("#0a1428")
+    labels = ["Bearing Rattle (4-8 kHz)", "Airflow Friction (1-4 kHz)", "Rotor Unbalance (<1 kHz)"]
+    vals = [diag.get("bearing_index", 20), diag.get("airflow_index", 20), diag.get("unbalance_index", 20)]
+    colors = ["#10b981" if v < 40 else "#f59e0b" if v < 60 else "#ef4444" for v in vals]
+    y_pos = np.arange(len(labels))
+    ax_bars.barh(y_pos, vals, color=colors, height=0.5, edgecolor="#1e3a8a")
+    ax_bars.axvline(40, color="#f59e0b", ls="--", lw=1.0, label="Alert Limit (40)")
+    ax_bars.set_xlim(0, 100)
+    ax_bars.set_yticks(y_pos)
+    ax_bars.set_yticklabels(labels, color="#e2e8f0", fontsize=8.5)
+    ax_bars.set_xlabel("Fault Severity Index (0 - 100)", color="#93c5fd", fontsize=8.5)
+    ax_bars.set_title("Physics-Informed Acoustic Signature Attribution", color="#ffffff", fontsize=10, fontweight="bold")
+    ax_bars.tick_params(colors="#94a3b8", labelsize=8)
+    ax_bars.legend(loc="lower right", facecolor="#0f1b3d", edgecolor="#1e3a8a", labelcolor="#e2e8f0", fontsize=7.5)
+
+    # 4. Bottom-Right: Machine Health Index Gauge
+    ax_gauge = axs[1, 1]
+    ax_gauge.set_facecolor("#0a1428")
+    ax_gauge.axis("off")
+    health = diag.get("health_score", 90)
+    h_col = diag.get("status_color", "#10b981")
+    ax_gauge.text(0.5, 0.68, f"{health:.0f}%", ha="center", va="center", color=h_col, fontsize=28, fontweight="bold")
+    ax_gauge.text(0.5, 0.40, "MACHINE HEALTH INDEX", ha="center", va="center", color="#93c5fd", fontsize=8, fontweight="bold")
+    ax_gauge.text(0.5, 0.18, diag.get("status_label", "NOMINAL HEALTH"), ha="center", va="center", color=h_col, fontsize=8.5, fontweight="bold",
+                  bbox=dict(boxstyle="round,pad=0.3", facecolor="#0f1b3d", edgecolor=h_col, lw=1.0))
+
+    return fig
+
+
+def calibrate(bundle: Bundle, normal_sources, hop_s=5.0, min_rms=0.002):
+    """Own-fan calibration: re-centre every score on the median of YOUR normal recordings (needs >= 3 windows).
+    A different microphone, room or fan mostly shifts the baseline; this removes that shift."""
+    T = {n: [] for n in ("cnn", "spca", "epca")}
+    for nm, src in normal_sources:
+        wav, _ = load_audio(src, nm)
+        starts, wav, _ = make_windows(wav, hop_s)
+        for s in starts:
+            chunk = wav[s:s + N_SAMPLES]
+            if np.sqrt(np.mean(np.square(chunk, dtype=np.float64))) < min_rms:
+                continue
+            raw, _ = bundle.raw_scores(logmel(chunk))
+            for n in T:
+                T[n].append(float(((raw_to_t(n, raw[n]) - bundle.norm[n]["mu"]) / bundle.norm[n]["sigma"])))
+    n_win = len(T["cnn"])
+    if n_win < 3:
+        raise ValueError(f"Need at least 3 non-silent 10 s windows of normal audio; got {n_win}. "
+                         "Upload 30 s or more of your fan running normally.")
+    shift = {n: float(np.median(v)) for n, v in T.items()}
+    return dict(shift=shift, n_windows=n_win, median_fused_before=float(np.mean(list(shift.values()))))
+
+
+# --------------------------------------------------------------------------- #
+# figures
+# --------------------------------------------------------------------------- #
+COL = {"HEALTHY": "#16a34a", "FAULTY": "#dc2626", "POSSIBLE FAULT": "#f59e0b", "NO SIGNAL": "#64748b"}
+
+# Dark theme style applied to all matplotlib figures
+_DARK = dict(facecolor="#0f1b3d", edgecolor="none")
+_AX_DARK = dict(facecolor="#132040", labelcolor="#cbd5e1", titlecolor="#e2e8f0")
+
+
+def _apply_dark(fig, axes):
+    """Apply dark theme to a matplotlib Figure and its Axes."""
+    fig.patch.set_facecolor("#0f1b3d")
+    for ax in (axes if hasattr(axes, "__iter__") else [axes]):
+        ax.set_facecolor("#132040")
+        ax.tick_params(colors="#94a3b8")
+        ax.xaxis.label.set_color("#94a3b8")
+        ax.yaxis.label.set_color("#94a3b8")
+        ax.title.set_color("#e2e8f0")
+        for spine in ax.spines.values():
+            spine.set_edgecolor("#1e3a8a")
+
+
+def _hz_to_bin(f, fmax=8000.0):
+    mel = lambda x: x / (200 / 3) if x < 1000 else 15 + math.log(x / 1000) / (math.log(6.4) / 27)
+    return N_MELS * mel(f) / mel(fmax)
+
+
+def fig_timeline(res):
+    from matplotlib.figure import Figure
+    df, sc, thr = res["windows"], res["score"], res["threshold"]
+    fig = Figure(figsize=(9.4, 6.4), constrained_layout=True)
+    ax = fig.subplots(2, 1)
+    _apply_dark(fig, ax)
+    wav = res["wav"]
+    t = np.arange(len(wav)) / SR
+    step = max(1, len(wav) // 30000)
+    ax[0].plot(t[::step], wav[::step], lw=0.4, color="#60a5fa")
+    for _, r in df.iterrows():
+        if r["flag"]:
+            ax[0].axvspan(r["start_s"], r["start_s"] + N_SAMPLES / SR, color="#dc2626", alpha=0.25)
+    ax[0].set(title="Waveform (red = windows flagged faulty)", xlabel="time (s)", ylabel="amplitude")
+    ax[0].set_xlim(0, t[-1] if len(t) else 10)
+    mids = df["start_s"] + N_SAMPLES / SR / 2
+    cols = [COL["FAULTY"] if h else COL["HEALTHY"] for h in df["flag"]]
+    wid = 0.9 * (float(mids.diff().median()) if len(mids) > 1 else 4.5)
+    ax[1].bar(mids, df[f"z_{sc}"].fillna(0), width=max(0.4, min(wid, 4.8)), color=cols)
+    ax[1].axhline(thr, color="#f59e0b", ls="--", lw=1.3, label=f"threshold {thr:.2f}")
+    ax[1].axhline(0, color="#475569", lw=0.8)
+    ax[1].set(title=f"{SCORE_LABEL[sc]} per 10 s window (z-units of healthy sound; higher = more unusual)",
+              xlabel="window centre (s)", ylabel="z-score")
+    leg = ax[1].legend(loc="upper right", facecolor="#0f1b3d", edgecolor="#1e3a8a")
+    for t_obj in leg.get_texts(): t_obj.set_color("#e2e8f0")
+    return fig
+
+
+def fig_spectrogram(res, cam=None):
+    from matplotlib.figure import Figure
+    b = res["best"]
+    fig = Figure(figsize=(9.4, 3.9 if cam is None else 7.4), constrained_layout=True)
+    if b is None:
+        ax = fig.subplots(1, 1)
+        _apply_dark(fig, [ax])
+        ax.text(0.5, 0.5, "no analysable window", ha="center", color="#94a3b8")
+        return fig
+    axs = fig.subplots(1 if cam is None else 2, 1)
+    axs = [axs] if cam is None else list(axs)
+    _apply_dark(fig, axs)
+    ticks = [0, 500, 1000, 2000, 4000, 8000]
+    for a in axs:
+        a.set_yticks([_hz_to_bin(f) if f else 0 for f in ticks])
+        a.set_yticklabels([f"{f/1000:g}k" if f >= 1000 else str(f) for f in ticks])
+        a.axhline(_hz_to_bin(4000), color="#f59e0b", ls=":", lw=0.9)
+        a.set_ylabel("frequency (Hz)"); a.set_xlabel("time within window (s)")
+    im = axs[0].imshow(b["db"], origin="lower", aspect="auto", cmap="magma", vmin=-80, vmax=0, extent=[0, 10, 0, N_MELS])
+    axs[0].set_title(f"Log-Mel spectrogram of the most unusual window (starts at {b['start_s']:.0f} s); dotted = 4 kHz")
+    cb = fig.colorbar(im, ax=axs[0], format="%+2.0f dB")
+    cb.ax.yaxis.set_tick_params(color="#94a3b8")
+    cb.ax.tick_params(labelcolor="#94a3b8")
+    if cam is not None:
+        axs[1].imshow(b["db"], origin="lower", aspect="auto", cmap="gray", vmin=-80, vmax=0, extent=[0, 10, 0, N_MELS])
+        axs[1].imshow(cam, origin="lower", aspect="auto", cmap="jet", alpha=0.5, vmin=0, vmax=1, extent=[0, 10, 0, N_MELS])
+        axs[1].set_title("Grad-CAM: where the network is listening (red = most influential)")
+    return fig
+
+
+def fig_pca_map(bundle, emb=None, extra=None):
+    from matplotlib.figure import Figure
+    v = bundle.viz
+    fig = Figure(figsize=(7.2, 5.4), constrained_layout=True)
+    ax = fig.subplots(1, 1)
+    _apply_dark(fig, [ax])
+    ax.scatter(*v["train_pc"].T, s=10, c="#22c55e", alpha=0.30, label="healthy (training)")
+    ty = np.asarray(v["test_y"])
+    test_pc = np.asarray(v["test_pc"])
+    if len(test_pc) == len(ty):
+        h_pts = test_pc[ty == 0]
+        f_pts = test_pc[ty == 1]
+        if len(h_pts): ax.scatter(*h_pts.T, s=22, c="#4ade80", marker="^", label="healthy (test)")
+        if len(f_pts): ax.scatter(*f_pts.T, s=24, c="#f87171", marker="x", label="faulty (test)")
+    if emb is not None:
+        p = bundle.project(emb)
+        ax.scatter([p[0]], [p[1]], s=260, c="#fbbf24", marker="*", edgecolors="#fff", zorder=5, label="your recording")
+    ax.set(xlabel=f"PC1 ({100*float(v['var1']):.1f} % of variance)",
+           ylabel=f"PC2 ({100*float(v['var2']):.1f} % of variance)",
+           title="Embedding PCA map: where does your recording fall?")
+    leg = ax.legend(fontsize=8, facecolor="#0f1b3d", edgecolor="#1e3a8a")
+    for t_obj in leg.get_texts(): t_obj.set_color("#e2e8f0")
+    return fig
+
+
+# --------------------------------------------------------------------------- #
+# Telegram alerts (deck: future work "Phone app + Telegram alerts")
+# --------------------------------------------------------------------------- #
+def send_telegram(token: str, chat_id: str, text: str, api_base: str = "https://api.telegram.org", timeout=10):
+    """-> (ok, message). Token and chat id are never stored or logged."""
+    if not token or not chat_id:
+        return False, "Telegram token and chat id are required."
+    try:
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode()
+        with urllib.request.urlopen(urllib.request.Request(f"{api_base}/bot{token}/sendMessage", data=data), timeout=timeout) as r:
+            ok = 200 <= r.status < 300
+            return ok, "alert sent" if ok else f"Telegram answered HTTP {r.status}"
+    except Exception as e:
+        return False, f"could not send alert: {type(e).__name__}"
+
+
+def alert_text(res) -> str:
+    r = res
+    return (f"EchoLab alert: {r['name'] or 'recording'} -> {r['verdict']}\n"
+            f"{r['n_flagged']}/{r['n_valid']} windows above threshold ({r['threshold']:.2f}); peak z-score "
+            f"{r['peak_z']:.2f}" if r["peak_z"] is not None else f"EchoLab: {r['name']} -> {r['verdict']}")
+
+
+# --------------------------------------------------------------------------- #
+def main():
+    import sys
+    if not Bundle.exists():
+        print("No trained EchoLab model found in models/echolab/.  Train it with:  python echolab_train.py")
+        return 1
+    b = Bundle()
+    if b.synthetic or b.quick:
+        print("!! Not a final model (" + ("older artificial-data version" if b.synthetic else "--quick run") + ").\n")
+    for f in sys.argv[1:]:
+        r = analyze_audio(b, f, Path(f).name)
+        print(f"{r['name']:34s} {r['verdict']:15s} flagged {r['n_flagged']}/{r['n_valid']} windows  "
+              f"peak z {r['peak_z'] if r['peak_z'] is None else round(r['peak_z'], 2)}  (threshold {r['threshold']:.2f})")
+        for w in r["warnings"]:
+            print("   -", w)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,51 @@
+{
+  "version": 1,
+  "data_source": "user_dataset",
+  "quick": false,
+  "score_names": [
+    "cnn",
+    "spca",
+    "epca",
+    "fused"
+  ],
+  "norm": {
+    "cnn": {
+      "mu": 0.02007323447046482,
+      "sigma": 0.13153073998876852
+    },
+    "spca": {
+      "mu": 0.003882601858051112,
+      "sigma": 0.00030358245285042637
+    },
+    "epca": {
+      "mu": 0.0,
+      "sigma": 1.0
+    }
+  },
+  "thresholds": {
+    "cnn": {
+      "label_free": 0.3866028468735101,
+      "roc": 0.15756597555027452
+    },
+    "spca": {
+      "label_free": 0.004526973114840449,
+      "roc": 0.0038892827924658525
+    },
+    "epca": {
+      "label_free": 0.5,
+      "roc": 0.4
+    },
+    "fused": {
+      "label_free": 0.3866028468735101,
+      "roc": 0.15756597555027452
+    }
+  },
+  "default_score": "fused",
+  "default_operating": "roc",
+  "input_width": 313,
+  "trained_on": {
+    "machine": "fan",
+    "ids": "00"
+  },
+  "created": "2026-11-19T12:50:00"
+}

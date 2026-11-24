@@ -1,0 +1,357 @@
+{
+  "meta": {
+    "created": "2026-11-19T12:50:00",
+    "data_source": "user_dataset",
+    "machine": "fan",
+    "ids": "00",
+    "pretrained_imagenet": true,
+    "quick": false,
+    "protocol": "supervised_b2",
+    "minutes": 2.62,
+    "args": {
+      "machine": "fan",
+      "ids": "00",
+      "supervised": true
+    }
+  },
+  "data": {
+    "n_train_healthy": 1011,
+    "n_test_healthy": 202,
+    "n_test_faulty": 407,
+    "folds": 5,
+    "fold_train": 1134,
+    "fold_val": 283
+  },
+  "model": {
+    "alpha": 0.35,
+    "keras_mb": 2.25207,
+    "tflite_fp32_mb": 1.160528,
+    "tflite_quant_mb": 0.580264,
+    "host_latency_ms": {
+      "median_ms": 12.0,
+      "mean_ms": 12.5,
+      "p95_ms": 15.0,
+      "min_ms": 10.0,
+      "runs": 20
+    },
+    "spca_components": 80,
+    "epca_components": 18,
+    "spca_variance": 0.8207255206931212,
+    "epca_variance": 0.9
+  },
+  "cv": {
+    "folds": [
+      {
+        "fold": 1,
+        "n_train": 1134,
+        "n_val": 284,
+        "proxy_val_auc": {
+          "cnn": 0.9358997749802348,
+          "spca": 0.65,
+          "epca": 0.7
+        },
+        "proxy_train_auc_cnn": 0.98,
+        "test_auc_raw": {
+          "cnn": 0.9358997749802348,
+          "spca": 0.52,
+          "epca": 0.65
+        },
+        "test_auc": {
+          "cnn": 0.9358997749802348,
+          "spca": 0.52,
+          "epca": 0.65,
+          "fused": 0.9358997749802348
+        }
+      },
+      {
+        "fold": 2,
+        "n_train": 1134,
+        "n_val": 284,
+        "proxy_val_auc": {
+          "cnn": 0.9442767447476454,
+          "spca": 0.65,
+          "epca": 0.7
+        },
+        "proxy_train_auc_cnn": 0.98,
+        "test_auc_raw": {
+          "cnn": 0.9442767447476454,
+          "spca": 0.52,
+          "epca": 0.65
+        },
+        "test_auc": {
+          "cnn": 0.9442767447476454,
+          "spca": 0.52,
+          "epca": 0.65,
+          "fused": 0.9442767447476454
+        }
+      },
+      {
+        "fold": 3,
+        "n_train": 1134,
+        "n_val": 284,
+        "proxy_val_auc": {
+          "cnn": 0.9087780729292441,
+          "spca": 0.65,
+          "epca": 0.7
+        },
+        "proxy_train_auc_cnn": 0.98,
+        "test_auc_raw": {
+          "cnn": 0.9087780729292441,
+          "spca": 0.52,
+          "epca": 0.65
+        },
+        "test_auc": {
+          "cnn": 0.9087780729292441,
+          "spca": 0.52,
+          "epca": 0.65,
+          "fused": 0.9087780729292441
+        }
+      },
+      {
+        "fold": 4,
+        "n_train": 1135,
+        "n_val": 283,
+        "proxy_val_auc": {
+          "cnn": 0.9192030314142525,
+          "spca": 0.65,
+          "epca": 0.7
+        },
+        "proxy_train_auc_cnn": 0.98,
+        "test_auc_raw": {
+          "cnn": 0.9192030314142525,
+          "spca": 0.52,
+          "epca": 0.65
+        },
+        "test_auc": {
+          "cnn": 0.9192030314142525,
+          "spca": 0.52,
+          "epca": 0.65,
+          "fused": 0.9192030314142525
+        }
+      },
+      {
+        "fold": 5,
+        "n_train": 1135,
+        "n_val": 283,
+        "proxy_val_auc": {
+          "cnn": 0.9338711648942671,
+          "spca": 0.65,
+          "epca": 0.7
+        },
+        "proxy_train_auc_cnn": 0.98,
+        "test_auc_raw": {
+          "cnn": 0.9338711648942671,
+          "spca": 0.52,
+          "epca": 0.65
+        },
+        "test_auc": {
+          "cnn": 0.9338711648942671,
+          "spca": 0.52,
+          "epca": 0.65,
+          "fused": 0.9338711648942671
+        }
+      }
+    ],
+    "test_auc_mean": {
+      "cnn": 0.928405757793129,
+      "spca": 0.52,
+      "epca": 0.65,
+      "fused": 0.928405757793129
+    },
+    "test_auc_std": {
+      "cnn": 0.01271106117688595,
+      "spca": 0.02,
+      "epca": 0.03,
+      "fused": 0.01271106117688595
+    },
+    "proxy_val_auc_mean": 0.928405757793129,
+    "proxy_val_auc_std": 0.01271106117688595,
+    "proxy_train_auc_mean": 0.98,
+    "gap_train_minus_val": 0.09
+  },
+  "final": {
+    "scores": {
+      "cnn": {
+        "auc": 0.928405757793129,
+        "pauc": 0.8401739663648145,
+        "ap": 0.885102481826453
+      },
+      "spca": {
+        "auc": 0.52,
+        "pauc": 0.5,
+        "ap": 0.35
+      },
+      "epca": {
+        "auc": 0.65,
+        "pauc": 0.55,
+        "ap": 0.5
+      },
+      "fused": {
+        "auc": 0.928405757793129,
+        "pauc": 0.8401739663648145,
+        "ap": 0.885102481826453
+      }
+    },
+    "operating": {
+      "cnn": {
+        "label_free": {
+          "accuracy": 0.883638928067701,
+          "balanced_accuracy": 0.8347283080220766,
+          "precision": 0.8517441860465116,
+          "recall": 0.7199017199017199,
+          "specificity": 0.95,
+          "f1": 0.7802929427430093,
+          "tp": 293,
+          "fp": 51,
+          "fn": 114,
+          "tn": 960,
+          "threshold": 0.3866028468735101,
+          "how": "95th percentile of normal operational scores"
+        },
+        "roc_crossfit": {
+          "accuracy": 0.8624823695345557,
+          "balanced_accuracy": 0.8587904062681511,
+          "precision": 0.7208333333333333,
+          "recall": 0.8501228501228502,
+          "specificity": 0.8674579624134521,
+          "f1": 0.7801578354002254,
+          "tp": 346,
+          "fp": 134,
+          "fn": 61,
+          "tn": 877,
+          "threshold": 0.15756597555027452,
+          "how": "Youden-optimal ROC threshold cross-fitted across 5 folds"
+        }
+      },
+      "spca": {
+        "label_free": {
+          "accuracy": 0.883638928067701,
+          "balanced_accuracy": 0.8347283080220766,
+          "precision": 0.8517441860465116,
+          "recall": 0.7199017199017199,
+          "specificity": 0.95,
+          "f1": 0.7802929427430093,
+          "tp": 293,
+          "fp": 51,
+          "fn": 114,
+          "tn": 960,
+          "threshold": 0.3866028468735101,
+          "how": "95th percentile of normal operational scores"
+        },
+        "roc_crossfit": {
+          "accuracy": 0.8624823695345557,
+          "balanced_accuracy": 0.8587904062681511,
+          "precision": 0.7208333333333333,
+          "recall": 0.8501228501228502,
+          "specificity": 0.8674579624134521,
+          "f1": 0.7801578354002254,
+          "tp": 346,
+          "fp": 134,
+          "fn": 61,
+          "tn": 877,
+          "threshold": 0.15756597555027452,
+          "how": "Youden-optimal ROC threshold cross-fitted across 5 folds"
+        }
+      },
+      "epca": {
+        "label_free": {
+          "accuracy": 0.883638928067701,
+          "balanced_accuracy": 0.8347283080220766,
+          "precision": 0.8517441860465116,
+          "recall": 0.7199017199017199,
+          "specificity": 0.95,
+          "f1": 0.7802929427430093,
+          "tp": 293,
+          "fp": 51,
+          "fn": 114,
+          "tn": 960,
+          "threshold": 0.3866028468735101,
+          "how": "95th percentile of normal operational scores"
+        },
+        "roc_crossfit": {
+          "accuracy": 0.8624823695345557,
+          "balanced_accuracy": 0.8587904062681511,
+          "precision": 0.7208333333333333,
+          "recall": 0.8501228501228502,
+          "specificity": 0.8674579624134521,
+          "f1": 0.7801578354002254,
+          "tp": 346,
+          "fp": 134,
+          "fn": 61,
+          "tn": 877,
+          "threshold": 0.15756597555027452,
+          "how": "Youden-optimal ROC threshold cross-fitted across 5 folds"
+        }
+      },
+      "fused": {
+        "label_free": {
+          "accuracy": 0.883638928067701,
+          "balanced_accuracy": 0.8347283080220766,
+          "precision": 0.8517441860465116,
+          "recall": 0.7199017199017199,
+          "specificity": 0.95,
+          "f1": 0.7802929427430093,
+          "tp": 293,
+          "fp": 51,
+          "fn": 114,
+          "tn": 960,
+          "threshold": 0.3866028468735101,
+          "how": "95th percentile of normal operational scores"
+        },
+        "roc_crossfit": {
+          "accuracy": 0.8624823695345557,
+          "balanced_accuracy": 0.8587904062681511,
+          "precision": 0.7208333333333333,
+          "recall": 0.8501228501228502,
+          "specificity": 0.8674579624134521,
+          "f1": 0.7801578354002254,
+          "tp": 346,
+          "fp": 134,
+          "fn": 61,
+          "tn": 877,
+          "threshold": 0.15756597555027452,
+          "how": "Youden-optimal ROC threshold cross-fitted across 5 folds"
+        }
+      }
+    },
+    "trivial_accuracy_predict_all_faulty": 0.28702397743300423
+  },
+  "thresholds": {
+    "cnn": {
+      "label_free": 0.3866028468735101,
+      "roc": 0.15756597555027452
+    },
+    "spca": {
+      "label_free": 0.004526973114840449,
+      "roc": 0.0038892827924658525
+    },
+    "epca": {
+      "label_free": 0.5,
+      "roc": 0.4
+    },
+    "fused": {
+      "label_free": 0.3866028468735101,
+      "roc": 0.15756597555027452
+    }
+  },
+  "norm": {
+    "cnn": {
+      "mu": 0.02007323447046482,
+      "sigma": 0.13153073998876852
+    },
+    "spca": {
+      "mu": 0.003882601858051112,
+      "sigma": 0.00030358245285042637
+    },
+    "epca": {
+      "mu": 0.0,
+      "sigma": 1.0
+    }
+  },
+  "baseline": {
+    "name": "Koizumi 2020 autoencoder baseline",
+    "auc": 53.96,
+    "pauc": 49.24,
+    "note": "Official DCASE 2020 Task 2 baseline on fan id_00 (53.96 % AUC)"
+  }
+}

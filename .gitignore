@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+
+# Audio datasets & raw data (do not push gigabytes of WAVs to GitHub)
+dataset/
+dataset_raw/
+fan/
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.zip
+!samples/*.wav
+
+# Temporary training fold caches & logs
+models/echolab_work/
+outputs/
+*.log
+training_log.txt
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
